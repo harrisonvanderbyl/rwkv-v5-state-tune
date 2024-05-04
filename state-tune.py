@@ -5,11 +5,34 @@ import torch
 import json
 import os
 import sys
-
-import torch
-import os
-import torch
+from tokenizer import world
 import torch.nn as nn
+
+from b2sdk.v2 import B2Api, InMemoryAccountInfo
+
+
+def download_file(filee, output):
+    D2_ACCESS_KEY_ID = os.getenv('D2_ACCESS_KEY_ID')
+    D2_SECRET_ACCESS_KEY = os.getenv('D2_SECRET_ACCESS_KEY')
+
+    info = InMemoryAccountInfo()
+
+    b2_api = B2Api(info)
+
+    b2_api.authorize_account("production", D2_ACCESS_KEY_ID, D2_SECRET_ACCESS_KEY)
+    try:
+
+        bucket_name, key_name = filee[5:].split('/', 1)  # Remove 's3://' prefix and split bucket and key
+
+        bucket = b2_api.get_bucket_by_name(bucket_name)
+
+        local_file_name = output
+
+        downloaded_file = bucket.download_file_by_name(key_name)
+
+        downloaded_file.save_to(local_file_name)
+    except Exception as e:
+        print(e)
 
 class RWKV_ChannelMix(torch.jit.ScriptModule):
     
@@ -58,6 +81,7 @@ class RWKV_TimeMix(torch.jit.ScriptModule):
           
         self.receptance = nn.Linear(n_embd, dim_att, bias=False)
         self.key = nn.Linear(n_embd, dim_att, bias=False)
+        
 
         self.value = nn.Linear(n_embd, dim_att, bias=False)
         self.output = nn.Linear(dim_att, n_embd, bias=False)
@@ -224,7 +248,6 @@ class RWKV(nn.Module):
         if modelpath:
             file = torch.load(modelpath)
             keys = list(file.keys())
-            print("keys", keys)
             # remove _orig_mod from keys for compatibility with torch.compile
             newObj = {}
             for key in keys:
@@ -247,7 +270,6 @@ class RWKV(nn.Module):
                     if layer > n_layer:
                         n_layer = layer
             n_layer = n_layer + 1
-            print("n_layer", n_layer)
             # try:
             dim_ffn = file[f"blocks.0.ffn.value.weight"].shape[1]
             # except:
@@ -256,7 +278,6 @@ class RWKV(nn.Module):
             
             try:
                 n_head = file[f"blocks.0.att.time_decay"].shape[0]
-                print("n_head", n_head)
             except:
                 n_head = 64
            
@@ -336,6 +357,7 @@ class v5tune( torch.nn.Module):
         self.model.requires_grad_(False)
         
         
+        
 
     def forward(self, idx, state, softembedding = None ,  **kwargs):
 
@@ -364,6 +386,13 @@ class v5tune( torch.nn.Module):
     def new_state(self, B, rand=False):
         
         return (
+            (torch.ones(self.layers*2,B, 1, self.hidden, dtype=self.dtype, device=self.device)).requires_grad_(True),
+            (torch.ones(self.layers,B,self.heads, self.head_size, self.head_size, dtype=torch.float, device=self.device)).requires_grad_(True)
+        )
+        
+    def zero_state(self, B, rand=False):
+        
+        return (
             (torch.zeros(self.layers*2,B, 1, self.hidden, dtype=self.dtype, device=self.device)).requires_grad_(True),
             (torch.zeros(self.layers,B,self.heads, self.head_size, self.head_size, dtype=torch.float, device=self.device)).requires_grad_(True)
         )
@@ -377,10 +406,10 @@ class v5tune( torch.nn.Module):
 args ={
     
     **{
-        key[2:] : eval(value) if value.isnumeric() else value for key, value in os.environ.items() if key.startswith("--")
+        key[2:] : eval(value) if value.replace(".","").isnumeric() else value.replace("\\n","\n")  for key, value in os.environ.items() if key.startswith("--")
     },
     **{
-        key : eval(value) if value.isnumeric() else value for key, value in [keys.split(" ") for keys in " ".join(sys.argv[1:]).split("--") if len(keys.split(" ")) == 2]
+        key : eval(value) if value.replace(".","").isnumeric() else value.replace("\\n","\n") for key, value in [(keys.split(" ")[0]," ".join(keys.split(" ")[1:]).rstrip()) for keys in " ".join(sys.argv[1:]).split("--") if len(keys.split(" "))]
     },
 }
 
@@ -388,58 +417,79 @@ print(args)
 
 
 
-from src.tokenizer import world
-
 def train_model(
-    learningrate = 50.0,
+    learningrate = 10.0,
     batchsize = 8,
     exit_loss = 0.5,
-    max_epochs = 5,
-    dataset_walk = "random",#, "sequential", "shuffled"
-    model_url = "b2://models/1B5.pth",
-    data_url = "b2://data/data.jsonl",
-    save_url_filename = random.randint(0,1000000000).__str__().zfill(10) + ".pth",
-    prompt_cutoff = 128, # set to -1 to disable
-    completion_cutoff = 128, # set to -1 to disable
+    max_epochs = 100,
+    dataset_walk = "shuffled",# "random", "sequential", "shuffled"
+    model_url = None,
+    data_url = None,
+    model_location = "model.pth",
+    data_path = "data.jsonl",
+    save_filename = "state.pth",
+    prompt_cutoff = -1, # set to -1 to disable
+    completion_cutoff = -1, # set to -1 to disable
     max_time = 60*60, # one hour
+    huggingface_dataset: str = "lonestar108/naughty-chat",
+    prompt_formatter = "user: {input}\n\nassistant:",
+    response_formatter = " {output}",
     **kwargs
 ):
 
     # download model
-    model_location = "model.pth"
+    
 
     # download model
     if not os.path.exists(model_location):
+        if model_url is None:
+            raise Exception("File does not exist, and Model URL is not provided")
+        
         if not "b2://" in model_url:
             os.system(f"wget {model_url} -O {model_location}")
         else:
-            os.system(f"b2 authorize-account $B2_KEY_ID $B2_APP_KEY && b2 download-file {model_url} {model_location}")
-
-    # download data
-    data_path = "data.jsonl"
+            download_file(model_url, model_location)
 
     # download data
     if not os.path.exists(data_path):
-        if not "b2://" in data_url:
-            os.system(f"wget {data_url} -O {data_path}")
+        if data_url is None and huggingface_dataset is None:
+            raise Exception("File does not exist, and Data URL is not provided")
+        
+        if huggingface_dataset is not None:
+            from datasets import load_dataset
+            dataset = load_dataset(huggingface_dataset)
+            tojsonl = dataset["train"]
+            with open(data_path, "w") as f:
+                for line in tojsonl:
+                    f.write(f"{json.dumps(line)}\n")
         else:
-            os.system(f"b2 authorize-account $B2_KEY_ID $B2_APP_KEY && b2 download-file {data_url} {data_path}")
+            if not "b2://" in data_url:
+                os.system(f"wget {data_url} -O {data_path}")
+            else:
+                download_file(data_url, data_path)
 
     # open training data
-    openfile = open("data.jsonl", "r")
+    openfile = open(data_path, "r")
 
     # load training data
     jsonl = [json.loads(x) for x in openfile.readlines()]
 
     # encode prompt data
     tasks = [
-        world.encode(x["prompt"][-prompt_cutoff-1:]) for x in jsonl
+        world.encode(prompt_formatter.format_map(x)[-prompt_cutoff - 1:]) for x in jsonl
     ]
 
+    # print formatted prompt
+    print("Masked input:\n",world.decode(tasks[0]))
+    
     # encode completion data
     completions = [
-        world.encode(x["completion"][:completion_cutoff]) for x in jsonl
+        world.encode(response_formatter.format_map(x)[:completion_cutoff]) for x in jsonl
     ]
+    
+     # print formatted prompt
+    print("Completion:\n",world.decode(completions[0]))
+    
 
     # get longest length for padding
     longest = max([len(x) + len(y) for x,y in zip(tasks,completions)])
@@ -472,72 +522,125 @@ def train_model(
     # start training, set exit conditions
     starttime = time.time()
     count = 0
+    running_avg = 4.0
 
-    # train
-    while loss > exit_loss and count < max_epochs*(batch.__len__()//batchsize) and time.time() - starttime < max_time:
+    try:
+        # train
+        while loss > exit_loss and count < max_epochs*(batch.__len__()//batchsize) and time.time() - starttime < max_time:
+            
+            torch.cuda.empty_cache()
+            gc.collect()
+            
+            # set dataset walk
+            batcrange = torch.randperm(batch.shape[0])[0:batchsize]                         if dataset_walk == "random" else \
+                        torch.arange(count*batchsize, (count+1)*batchsize) % batch.shape[0] if dataset_walk == "sequential" else \
+                        shuffled[count*batchsize:(count+1)*batchsize]                       if dataset_walk == "shuffled" else \
+                        torch.randperm(batch.shape[0])[0:batchsize]
+            
+            
+            # get batchitems and mask
+            batchsub = batch[batcrange]
+            submask = maskinputs[batcrange]
+            
+            # remove extra padding
+            for i in range(batchsub.shape[1]):
+                if submask[:,-i].sum() != 0:
+                    batchsub = batchsub[:,:-i].clone()
+                    submask = submask[:,:-i].clone()
+                    break
+                
+            # move to cuda
+            batchsub = batchsub.cuda()
+            
+            # zero gradients
+            emptystate[0].grad = None
+            emptystate[1].grad = None
+            softembedding.grad = None
+            
+            # forward pass
+            logits = model.forward(batchsub,emptystate,softembedding)
+            
+            # calculate loss
+            logitsize = logits.shape[-1]
+            logits = logits[:,1:-1].reshape(-1,logitsize)[submask.reshape(-1)]
+            batchinp = batchsub[:,1:].reshape(-1)[submask.reshape(-1)]
+            loss = lossfunc(logits, batchinp)
         
-        torch.cuda.empty_cache()
-        gc.collect()
+            if(loss.isnan()):
+                print("Loss is NaN")
+                loss = 4.0
+                continue
+            # backward pass
+            loss.backward()
+            
+            # update state
+            emptystate = (
+                torch.tensor(emptystate[0] - emptystate[0].grad *learningrate/(loss+0.001) , requires_grad=True),
+                torch.tensor(emptystate[1] - emptystate[1].grad *learningrate/(loss+0.001), requires_grad=True)
+                ) 
+            
+            # update softembedding
+            softembedding = torch.tensor(softembedding - softembedding.grad *learningrate/(loss+0.001), requires_grad=True)
+            
+            running_avg = running_avg * 0.95 + loss.cpu().item() * 0.05
+            
+            # print loss, 5 decimal places
+            mmr = running_avg.__format__(".5f")
+            print(mmr, end="", flush=True)
+            
+
+            count += 1
+                
+            print("\n", end="", flush=True)
+    # on ctrl-c save state
+    except KeyboardInterrupt:
+        print("\nKeyboard interrupt, saving state")
+    except Exception as e:
+        print("\nError, saving state to backup.pth")
+        torch.save([softembedding,emptystate], "backup.pth")
+        raise e
+    finally:
+        print("Saving state")
+        # save state
+        torch.save([softembedding,emptystate], save_filename)
         
-        # set dataset walk
-        batcrange = torch.randperm(batch.shape[0])[0:batchsize]                         if dataset_walk == "random" else \
-                    torch.arange(count*batchsize, (count+1)*batchsize) % batch.shape[0] if dataset_walk == "sequential" else \
-                    shuffled[count*batchsize:(count+1)*batchsize]                       if dataset_walk == "shuffled" else \
-                    torch.randperm(batch.shape[0])[0:batchsize]
         
-        
-        # get batchitems and mask
-        batchsub = batch[batcrange]
-        submask = maskinputs[batcrange]
-        
-        # remove extra padding
-        for i in range(batchsub.shape[1]):
-            if submask[:,-i].sum() != 0:
-                batchsub = batchsub[:,:-i].clone()
-                submask = submask[:,:-i].clone()
+
+    
+if args.get("prompt", False):
+    promptin = args["prompt"]
+    model = v5tune(args["model_location"])
+    state = torch.load(args["save_filename"])
+    
+    print("Base model:\n")
+    prompt = world.encode(promptin)
+    promptlength = len(prompt)
+    for i in range(50):
+        prompt += [model.forward(prompt, model.zero_state(1))[0,-1].argmax().cpu().item()]
+        try:
+            toshow = world.decode(prompt[promptlength:])
+            if toshow == "\n\n":
                 break
-            
-        # move to cuda
-        batchsub = batchsub.cuda()
+            promptlength += 1
+            print(toshow, end="", flush=True)
+        except:
+            continue
         
-        # zero gradients
-        model.zero_grad()
-        
-        # forward pass
-        logits = model.forward(batchsub,emptystate,softembedding)
-        
-        # calculate loss
-        logitsize = logits.shape[-1]
-        logits = logits[:,1:-1].reshape(-1,logitsize)[submask.reshape(-1)]
-        batchinp = batchsub[:,1:].reshape(-1)[submask.reshape(-1)]
-        loss = lossfunc(logits, batchinp)
-    
-        # backward pass
-        loss.backward()
-        
-        # update state
-        emptystate = (
-            torch.tensor(emptystate[0] - emptystate[0].grad *learningrate/(loss+0.001) , requires_grad=True),
-            torch.tensor(emptystate[1] - emptystate[1].grad *learningrate/(loss+0.001), requires_grad=True)
-            ) 
-        
-        # update softembedding
-        softembedding = torch.tensor(softembedding - softembedding.grad *learningrate/(loss+0.001), requires_grad=True)
-        
-        # print loss, 5 decimal places
-        mmr = loss.cpu().item().__format__(".5f")
-        print(mmr, end="", flush=True)
-        
+    print("\n\nWith tuned state:\n")
+    prompt = world.encode(promptin)
+    promptlength = len(prompt)
+    for i in range(50):
+        prompt += [model.forward(prompt, state[1],state[0])[0,-1].argmax().cpu().item()]
+        try:
+            toshow = world.decode(prompt[promptlength:])
+            if toshow == "\n\n":
+                break
+            promptlength += 1
+            print(toshow, end="", flush=True)
+        except:
+            continue
+    print("\n\n")
+else:
+    train_model(**args)
 
-        count += 1
-            
-        print("\n", end="", flush=True)
-        
-    # save state
-    torch.save([softembedding,emptystate], "state.pth")
 
-    # upload state
-    os.system(f"b2 authorize-account $B2_KEY_ID $B2_APP_KEY && b2 upload-file {save_url_filename} state.pth")
-    
-    
-train_model(**args)
