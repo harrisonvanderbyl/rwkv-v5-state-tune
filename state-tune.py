@@ -416,9 +416,8 @@ args ={
 print(args)
 
 
-
 def train_model(
-    learningrate = 10.0,
+    learningrate = 0.1,
     batchsize = 8,
     exit_loss = 0.5,
     max_epochs = 100,
@@ -523,7 +522,10 @@ def train_model(
     starttime = time.time()
     count = 0
     running_avg = 4.0
+    
+    optimizer = torch.optim.Adam([softembedding,emptystate[0],emptystate[1]], lr=learningrate)
 
+    losses = []
     try:
         # train
         while loss > exit_loss and count < max_epochs*(batch.__len__()//batchsize) and time.time() - starttime < max_time:
@@ -553,9 +555,7 @@ def train_model(
             batchsub = batchsub.cuda()
             
             # zero gradients
-            emptystate[0].grad = None
-            emptystate[1].grad = None
-            softembedding.grad = None
+            optimizer.zero_grad()
             
             # forward pass
             logits = model.forward(batchsub,emptystate,softembedding)
@@ -573,16 +573,19 @@ def train_model(
             # backward pass
             loss.backward()
             
-            # update state
-            emptystate = (
-                torch.tensor(emptystate[0] - emptystate[0].grad *learningrate/(loss+0.001) , requires_grad=True),
-                torch.tensor(emptystate[1] - emptystate[1].grad *learningrate/(loss+0.001), requires_grad=True)
-                ) 
+            # # update state
+            # emptystate = (
+            #     torch.tensor(emptystate[0] - emptystate[0].grad *learningrate/(loss+0.001) , requires_grad=True),
+            #     torch.tensor(emptystate[1] - emptystate[1].grad *learningrate/(loss+0.001), requires_grad=True)
+            #     ) 
             
-            # update softembedding
-            softembedding = torch.tensor(softembedding - softembedding.grad *learningrate/(loss+0.001), requires_grad=True)
+            # # update softembedding
+            # softembedding = torch.tensor(softembedding - softembedding.grad *learningrate/(loss+0.001), requires_grad=True)
+            
+            optimizer.step()
             
             running_avg = running_avg * 0.95 + loss.cpu().item() * 0.05
+            losses += [loss.cpu().item()]
             
             # print loss, 5 decimal places
             mmr = running_avg.__format__(".5f")
@@ -603,6 +606,12 @@ def train_model(
         print("Saving state")
         # save state
         torch.save([softembedding,emptystate], save_filename)
+        
+        # show loss curve
+        import matplotlib.pyplot as plt
+        plt.plot(losses, label='ln = '+str(learningrate))
+        plt.legend()
+        plt.show()
         
         
 
