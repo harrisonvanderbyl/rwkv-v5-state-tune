@@ -417,10 +417,10 @@ print(args)
 
 
 def train_model(
-    learningrate = 0.1,
+    learningrate = 0.01,
     batchsize = 8,
     exit_loss = 0.5,
-    max_epochs = 100,
+    max_epochs = 10,
     dataset_walk = "shuffled",# "random", "sequential", "shuffled"
     model_url = None,
     data_url = None,

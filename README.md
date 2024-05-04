@@ -27,10 +27,10 @@ these also work as ENV variables in the format --key=value
 **Training**
 ```sh
 python3 ./state-tune.py \
---learningrate 10.0 \
+--learningrate 0.01 \
 --batchsize 8 \
 --exit_loss 0.5 \
---max_epochs 100 \
+--max_epochs 10 \
 --dataset_walk shuffled \
 --model_url "" \
 --data_url "" \
