@@ -27,9 +27,9 @@ these also work as ENV variables in the format --key=value
 **Training**
 ```sh
 python3 ./state-tune.py \
---learningrate 0.05 \
---batchsize 8 \
---exit_loss 2.0 \
+--learningrate 0.01 \
+--batchsize 4 \
+--exit_loss 1.5 \
 --max_epochs 10 \
 --dataset_walk shuffled \
 --model_url "" \
