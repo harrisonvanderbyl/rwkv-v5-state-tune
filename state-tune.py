@@ -384,7 +384,7 @@ class RWKV(nn.Module):
         
         self.emb = nn.Embedding(vocab_size, n_embd)
         
-        self.blocks = nn.ModuleList([
+        self.blocks = nn.Sequential(*[
         
             Block(i, n_layer, n_embd, n_head, self.head_size, n_embd, dim_ffn) for i in range(n_layer)
         ])
@@ -405,15 +405,9 @@ class RWKV(nn.Module):
     def forward(self, idx: torch.Tensor):
         x = self.emb(idx)
         x = self.ln_in(x)
-        
-       
-
-        for i,b in enumerate(self.blocks):
-            x = b(x)
-
+        x = self.blocks(x)
         x = self.ln_out(x)
         x = self.head(x)
-
         return x
 
 
