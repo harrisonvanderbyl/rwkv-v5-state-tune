@@ -47,13 +47,14 @@ python3 ./state-tune.py \
 
 **Testing**
 
-This does not use recurrent mode, and temperature of 0
+This uses a temperature of 0
 
 ```sh
 python3 ./state-tune.py \
 --model_location model.pth \
 --save_filename state.pth \
---prompt "user: How is you day going?\n\nassistant:"
+--prompt "user: How is you day going?\n\nassistant:" \
+--device cuda
 ```
 
 ## Explaination of arguments
@@ -90,8 +91,6 @@ if the file does not exist, download from this file location
 
 if the jsonl file does not exist, download it.
 
-prompt is masked during training.
-
 **Huggingface dataset**
 
 Loads a huggingface dataset and puts it into a jsonl format, takes precedence over data url
@@ -124,6 +123,8 @@ End training after this many seconds
 
 Format the prompt into something more palatable for the model, {x} is replaced with that key in the jsonl
 
+prompt is masked during training.
+
 **Response formatter**
 
 Format the response into something more palatable for the model, {x} is replaced with that key in the jsonl
@@ -139,27 +140,13 @@ Format the response into something more palatable for the model, {x} is replaced
 
 output file is as such, with tensor dimensions
 
-```js
-[
-    softprompt(1,1,n_embed),
-    (
-        time_shifts(n_layer*2, 1, 1, n_embed),
-        time_mix(n_layer, 1, n_head, n_embed/n_head, n_embed/n_head)
-    )
-]
-```
-
-## Softprompt
-
-softprompt is a custom embedding, taking the place of an init token.
-
-Technically, you can compress it into the state via a single forward pass in recurrent mode, and that functionality will be added soon.
-
-you can add the functionality to existing implementations like such:
 ```py
-x = self.emb(idx)
-if softembedding is not None:
-    x = torch.cat([softembedding,x], dim=1) # assumption 1 is time dimension
+{
+    "blocks.0.ffn.shift.state": (1,1,dims),
+    "blocks.0.att.shift.state": (1,1,dims),
+    "blocks.0.att.wkvstae" : (heads, dims/heads, dims/heads),
+    "blocks.1.ffn.shift.sta..."
+}
 ```
 
 ## Debugging transpositions

@@ -34,8 +34,38 @@ def download_file(filee, output):
         downloaded_file.save_to(local_file_name)
     except Exception as e:
         print(e)
+        
+class TimeShift(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.state = None
+        
+    def forward(self, x):
+        B = x.shape[0]
+        
+        if not self.training:
+            
+            next = torch.cat((self.state, x[:,:-1]), dim=1)
+            self.state = x[:,-1:].detach().clone()
+            
+        else:
+            next = torch.cat((self.state.repeat(B,1,1), x[:,:-1]), dim=1)
+            
+        return next
+    
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
+        
+        self.state = state_dict.pop(prefix+"state") if prefix+"state" in state_dict else None
+        
+        return super()._load_from_state_dict(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs)
+    
+    def _save_to_state_dict(self, destination, prefix, keep_vars):
+            
+        destination[prefix+"state"] = self.state
+        
+        return super()._save_to_state_dict(destination, prefix, keep_vars)
 
-class RWKV_ChannelMix(torch.jit.ScriptModule):
+class RWKV_ChannelMix(nn.Module):
     
     def __init__(self, layer_id, n_layer, n_embd, dim_ffn):
         super().__init__()
@@ -48,11 +78,12 @@ class RWKV_ChannelMix(torch.jit.ScriptModule):
         self.value = torch.nn.Linear(dim_ffn, n_embd, bias=False)
         self.lastlayer = layer_id == n_layer - 1
         
-    def forward(self, x, last_state: torch.Tensor):
+        self.shift = TimeShift()
+        
+    def forward(self, x):
  
     
-        xx = torch.concat((last_state, x[:, :-1]),
-                          dim=1)
+        xx = self.shift(x)
         
 
         xk = x * self.time_mix_k + xx * (1 - self.time_mix_k)
@@ -60,7 +91,7 @@ class RWKV_ChannelMix(torch.jit.ScriptModule):
         kv = self.value( torch.relu( self.key(xk) ) ** 2 )
         return (torch.sigmoid(self.receptance(xr)) * kv)
     
-class RWKV_TimeMix(torch.jit.ScriptModule):
+class RWKV_TimeMix(nn.Module):
     def __init__(self, layer_id, n_layer, n_embd, n_head, head_size, dim_att):
         super().__init__()
         
@@ -94,28 +125,38 @@ class RWKV_TimeMix(torch.jit.ScriptModule):
         self.register_buffer("time_faaaa", torch.zeros(n_head, self.head_size))
         
         self.silu = nn.SiLU()
-        self.shift = nn.ZeroPad2d((0, 0, 0, 0, 0, 0, 1, -1))
+        self.shift = TimeShift()
+        
+        self.wkvstate = None
         
     def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
         
-        state_dict[prefix+"time_decay"] = state_dict[prefix+"time_decay"].double().view(self.n_head,-1).float().contiguous()
-        state_dict[prefix+"time_faaaa"] = state_dict[prefix+"time_faaaa"].view(self.n_head,self.head_size)
+        if prefix+"time_decay" in state_dict:
+            state_dict[prefix+"time_decay"] = state_dict[prefix+"time_decay"].double().view(self.n_head,-1).float().contiguous()
+            state_dict[prefix+"time_faaaa"] = state_dict[prefix+"time_faaaa"].view(self.n_head,self.head_size)
+        
+        self.wkvstate = state_dict.pop(prefix+"wkvstate") if prefix+"wkvstate" in state_dict else None
+        
         a = super()._load_from_state_dict(state_dict, prefix, local_metadata, False, missing_keys, unexpected_keys, error_msgs)
         
         return a
     
     
 
-    def forward(self, x, last_state_shift, last_state_wkv):
+    def forward(self, x):
         
         # Get the x sizing
         B, T, C = x.shape
-        H = last_state_wkv.shape[-3]
+        H = self.time_decay.shape[0]
+        if self.training:
+            last_state_wkv = self.wkvstate.repeat(B,1,1)
+        else:
+            last_state_wkv = self.wkvstate
         K = last_state_wkv.shape[-2]
         
         # Perform the tokenshift
-        xx = torch.concat((last_state_shift, x[:, :-1]), dim=1)
-    
+        xx = self.shift(x)
+            
 
         # Get the xk, xv, xr, xg, and rkvg
         xk = x * self.time_mix_k + xx * (1 - self.time_mix_k)
@@ -125,6 +166,10 @@ class RWKV_TimeMix(torch.jit.ScriptModule):
 
         
         g = self.silu(self.gate(xg))
+        
+        
+            
+            
         
         if g.device.type == "cuda":
             
@@ -141,17 +186,26 @@ class RWKV_TimeMix(torch.jit.ScriptModule):
             rwfor = r.mul(wfor).reshape(B,T,H,K).transpose(1,2).reshape(B*H,T,K)
             
             
-            xr = torch.bmm(rwfor,last_state_wkv.view(-1,K,K).transpose(1,2)).view(B,H,T,K).transpose(1,2).reshape(B,T,H*K)
+            xr = torch.bmm(rwfor,last_state_wkv.view(-1,K,K)).view(B,H,T,K).transpose(1,2).reshape(B,T,H*K)
+            
+            if not self.training:
+                with torch.no_grad():
+                    wback = self.time_decay.exp().neg().exp().unsqueeze(1).pow(torch.arange(T-1,-1,-1,device=r.device).reshape(1,-1,1)).repeat(B,1,1)
+                    
+                    self.wkvstate = last_state_wkv.detach().clone().mul(self.time_decay.unsqueeze(1).exp().neg().exp().pow(T).repeat(B,1,1))
+                    
+                    #calculate the effects k,v have on the state
+                    torch.baddbmm(self.wkvstate,k.transpose(0,1).reshape(T,B*H,K).transpose(0,1).mul(wback).transpose(1,2),v.transpose(0,1).reshape(T,B*H,K).transpose(0,1),out=self.wkvstate)
             
             xr += RUN_CUDA_RWKV5(B,T,C,H,r,k,v,self.time_decay,self.time_faaaa)
-        
+
             
         else:    
                        
             # torch.zeros(B, T, H, V, dtype=torch.bfloat16, device=x.device)
-            r:torch.Tensor = self.receptance(xr).transpose(0,1).reshape(T,B*H,K).transpose(0,1).float()
-            k:torch.Tensor = self.key(xk).transpose(0,1).reshape(T,B*H,K).transpose(0,1)   .float() 
-            v:torch.Tensor = self.value(xv).transpose(0,1).reshape(T,B*H,K).transpose(0,1) .float()
+            r:torch.Tensor = self.receptance(xr).transpose(0,1).reshape(T,B*H,K).transpose(0,1)
+            k:torch.Tensor = self.key(xk).transpose(0,1).reshape(T,B*H,K).transpose(0,1)    
+            v:torch.Tensor = self.value(xv).transpose(0,1).reshape(T,B*H,K).transpose(0,1) 
             
             # calculate time decay
             wfor = self.time_decay.exp().neg().exp().unsqueeze(1).pow(torch.arange(0,T,device=r.device).reshape(1,-1,1)).repeat(B,1,1)
@@ -162,21 +216,30 @@ class RWKV_TimeMix(torch.jit.ScriptModule):
             
             u:torch.Tensor = self.time_faaaa.view(H,1,K).repeat(B,1,1)
             
-            xr = torch.bmm(rwfor,last_state_wkv.float().view(-1,K,K).transpose(1,2))
+            xr = torch.bmm(rwfor,last_state_wkv.view(-1,K,K))
             
             xr += (k*(u*r)).sum(-1,True).mul(v).reshape(-1,T,K)
             
             xrr = xr
             
+            wback = wfor[:,torch.arange(T-1,-1,-1)].transpose(1,2)        
+            k = k.transpose(1,2).mul(wback)
+            
+            if not self.training:
+                with torch.no_grad():
+                    self.wkvstate = last_state_wkv.detach().clone().mul(self.time_decay.unsqueeze(1).exp().neg().exp().pow(T).repeat(B,1,1))
+                    
+                    #calculate the effects k,v have on the state
+                    torch.baddbmm(self.wkvstate,k,v,out=self.wkvstate)
+                
+            
             # calculate the effects kvr have on the future activations
             r = r[:,1:]
-            k = k[:,:-1].transpose(1,2)
+            k = k[:,:,:-1]
             v = v[:,:-1]
             xrr = xr[:,1:]
             
-            wback = wfor[:,torch.arange(T-2,-1,-1)].transpose(1,2)        
             
-            k = k.mul(wback)
                     
             # 64,T,T
             splits = 64
@@ -188,7 +251,7 @@ class RWKV_TimeMix(torch.jit.ScriptModule):
                     mrr[:] = torch.baddbmm(mrr,mkk,v[:,j:j+splits])
                     
         
-    
+            
                 
         # Reshape and normalize the logits
         x_logits = self.ln_x(xr.bfloat16().transpose(0,1).reshape(T,B,H,1,K).transpose(0,1).reshape(-1,C)).view(B, T, C)#.transpose(0,1)
@@ -199,7 +262,7 @@ class RWKV_TimeMix(torch.jit.ScriptModule):
 
 
 
-class Block(torch.jit.ScriptModule):
+class Block(nn.Module):
 
     def __init__(self, layer_id, n_layer, n_embd, n_head, head_size, dim_att, dim_ffn):
         super().__init__()
@@ -214,20 +277,17 @@ class Block(torch.jit.ScriptModule):
     
         # Setup droupout at block level
 
-    def forward(self, x, time_mix_shift, channel_mix_state, time_mix_state):
+    def forward(self, x):
 
         att_out = self.att(
-                self.ln1(x),
-                time_mix_shift,
-                time_mix_state
+                self.ln1(x)
             )
 
         
         x = x + att_out
         
         ffn_out = self.ffn(
-            self.ln2(x),
-            channel_mix_state,
+            self.ln2(x)
         )
         
         x = x + ffn_out
@@ -342,15 +402,14 @@ class RWKV(nn.Module):
         
             
 
-    def forward(self, idx: torch.Tensor, last_shift_states: torch.Tensor,
-                last_wkv_states: torch.Tensor, softembedding:torch.Tensor = None):
+    def forward(self, idx: torch.Tensor):
         x = self.emb(idx)
-        if softembedding is not None:
-            x = torch.cat([softembedding,x], dim=1)
         x = self.ln_in(x)
+        
+       
 
         for i,b in enumerate(self.blocks):
-            x = b(x, last_shift_states[i*2],last_shift_states[i*2+1], last_wkv_states[i])
+            x = b(x)
 
         x = self.ln_out(x)
         x = self.head(x)
@@ -381,7 +440,7 @@ class v5tune( torch.nn.Module):
         
         
 
-    def forward(self, idx, state, softembedding = None ,  **kwargs):
+    def forward(self, idx ,  **kwargs):
 
         if isinstance(idx, list):
             idx = torch.tensor(idx, device=self.device, dtype=torch.int64)
@@ -394,37 +453,45 @@ class v5tune( torch.nn.Module):
             idx = idx.unsqueeze(0)
             idx = idx.repeat(1, 1)
             
-        stateo = state[1].repeat(1, idx.shape[0], 1,1,1)
-        statei = state[0].repeat(1, idx.shape[0], 1, 1)
-        if softembedding is not None:
-            softembedding = softembedding.repeat(idx.shape[0], 1, 1)
+    
             
-        output = self.model.forward(idx, statei, stateo, softembedding)
+        output = self.model.forward(idx)
         
         return output
     
         
         
-    def new_state(self, B, rand=False):
+    def new_state(self, B=1, rand=False, offset=0, scale=1):
         
-        return (
-            (torch.ones(self.layers*2,B, 1, self.hidden, dtype=self.dtype, device=self.device)).requires_grad_(True),
-            (torch.ones(self.layers,B,self.heads, self.head_size, self.head_size, dtype=torch.bfloat16 if self.device.type=="cuda" else torch.float32, device=self.device)).requires_grad_(True)
-        )
+        func = torch.randn if rand else torch.zeros
+        return {
+                **{
+                    f"blocks.{i}.att.shift.state":func(B, 1, self.hidden, dtype=self.dtype, device=self.device).mul(scale).add(offset).requires_grad_(True) for i in range(self.layers)
+                },
+                **{
+                    f"blocks.{i}.ffn.shift.state": func(B, 1, self.hidden, dtype=self.dtype, device=self.device).mul(scale).add(offset).requires_grad_(True) for i in range(self.layers)
+                },
+                **{
+                    f"blocks.{i}.att.wkvstate": func(B* self.heads, self.head_size, self.head_size, dtype=self.dtype, device=self.device).mul(scale).add(offset).requires_grad_(True) for i in range(self.layers)
+                }
+        }
         
-    def zero_state(self, B, rand=False):
+    def load_state(self, state):
+        self.model.load_state_dict(state, strict=False)
+        return self
         
-        return (
-            (torch.zeros(self.layers*2,B, 1, self.hidden, dtype=self.dtype, device=self.device)).requires_grad_(True),
-            (torch.zeros(self.layers,B,self.heads, self.head_size, self.head_size, dtype=torch.bfloat16 if self.device.type=="cuda" else torch.float32, device=self.device)).requires_grad_(True)
-        )
-        
+
     def new_softembedding(self, B):
         return torch.zeros(B, 1,self.hidden, dtype=self.dtype, device=self.device).requires_grad_(True)
     
     def cpu(self):
         self.device = torch.device("cpu")
         self.model = self.model.to(self.device)
+        return self
+    
+    def to(self, device):
+        self.device = device
+        self.model = self.model.to(device)
         return self
 
     
@@ -534,11 +601,12 @@ def train_model(
 
     # load model
     model = v5tune(model_location).cuda()
-
+    
     # initialize state
     loss = 4.0
     emptystate = model.new_state(1, True)
-    softembedding = model.new_softembedding(1)
+    model.load_state(emptystate)    
+    # softembedding = model.new_softembedding(1)
 
     # generate some shuffles
     shuffled = [torch.randperm(batch.shape[0]) for i in range(max_epochs)]
@@ -550,7 +618,7 @@ def train_model(
     count = 0
     running_avg = 4.0
     
-    optimizer = torch.optim.Adam([softembedding,emptystate[0],emptystate[1]], lr=learningrate)
+    optimizer = torch.optim.Adam(list(emptystate.values()), lr=learningrate)
 
     losses = []
     try:
@@ -585,11 +653,11 @@ def train_model(
             optimizer.zero_grad()
             
             # forward pass
-            logits = model.forward(batchsub,emptystate,softembedding)
+            logits = model.forward(batchsub)
             
             # calculate loss
             logitsize = logits.shape[-1]
-            logits = logits[:,1:-1].reshape(-1,logitsize)[submask.reshape(-1)]
+            logits = logits[:,:-1].reshape(-1,logitsize)[submask.reshape(-1)]
             batchinp = batchsub[:,1:].reshape(-1)[submask.reshape(-1)]
             loss = lossfunc(logits, batchinp)
         
@@ -599,15 +667,6 @@ def train_model(
                 continue
             # backward pass
             loss.backward()
-            
-            # # update state
-            # emptystate = (
-            #     torch.tensor(emptystate[0] - emptystate[0].grad *learningrate/(loss+0.001) , requires_grad=True),
-            #     torch.tensor(emptystate[1] - emptystate[1].grad *learningrate/(loss+0.001), requires_grad=True)
-            #     ) 
-            
-            # # update softembedding
-            # softembedding = torch.tensor(softembedding - softembedding.grad *learningrate/(loss+0.001), requires_grad=True)
             
             optimizer.step()
             
@@ -627,12 +686,12 @@ def train_model(
         print("\nKeyboard interrupt, saving state")
     except Exception as e:
         print("\nError, saving state to backup.pth")
-        torch.save([softembedding,emptystate], "backup.pth")
+        torch.save(emptystate, "backup.pth")
         raise e
     finally:
         print("Saving state")
         # save state
-        torch.save([softembedding,emptystate], save_filename)
+        torch.save(emptystate, save_filename)
         
         # show loss curve
         import matplotlib.pyplot as plt
@@ -645,16 +704,17 @@ def train_model(
     
 if args.get("prompt", False):
     promptin = args["prompt"]
-    model = v5tune(args["model_location"]).cuda()
+    model = v5tune(args["model_location"]).to(args.get("device", "cuda")).train(False)
+    model.load_state(model.new_state())
     state = torch.load(args["save_filename"])
     
     print("Base model:\n")
     prompt = world.encode(promptin)
     promptlength = len(prompt)
     for i in range(50):
-        prompt += [model.forward(prompt, model.zero_state(1))[0,-1].argmax().cpu().item()]
+        prompt = [model.forward(prompt)[0,-1].argmax().cpu().item()]
         try:
-            toshow = world.decode(prompt[promptlength:])
+            toshow = world.decode(prompt)
             if toshow == "\n\n":
                 break
             promptlength += 1
@@ -662,19 +722,23 @@ if args.get("prompt", False):
         except:
             continue
         
-    print("\n\nWith tuned state:\n")
+    model.load_state(state)
+    
+    print("\n\nTuned model:\n")
     prompt = world.encode(promptin)
     promptlength = len(prompt)
     for i in range(50):
-        prompt += [model.forward(prompt, (state[1][0].to(model.device),state[1][1].to(model.device)),state[0].to(model.device))[0,-1].argmax().cpu().item()]
+        prompt = [model.forward(prompt)[0,-1].argmax().cpu().item()]
         try:
-            toshow = world.decode(prompt[promptlength:])
+            toshow = world.decode(prompt)
             if toshow == "\n\n":
                 break
             promptlength += 1
             print(toshow, end="", flush=True)
         except:
             continue
+        
+    
     print("\n\n")
 else:
     train_model(**args)
