@@ -162,7 +162,7 @@ class RWKV_TimeMix(torch.jit.ScriptModule):
             
             u:torch.Tensor = self.time_faaaa.view(H,1,K).repeat(B,1,1)
             
-            xr = torch.bmm(rwfor,last_state_wkv.view(-1,K,K).transpose(1,2))
+            xr = torch.bmm(rwfor,last_state_wkv.float().view(-1,K,K).transpose(1,2))
             
             xr += (k*(u*r)).sum(-1,True).mul(v).reshape(-1,T,K)
             
@@ -421,6 +421,11 @@ class v5tune( torch.nn.Module):
         
     def new_softembedding(self, B):
         return torch.zeros(B, 1,self.hidden, dtype=self.dtype, device=self.device).requires_grad_(True)
+    
+    def cpu(self):
+        self.device = torch.device("cpu")
+        self.model = self.model.to(self.device)
+        return self
 
     
         
@@ -640,7 +645,7 @@ def train_model(
     
 if args.get("prompt", False):
     promptin = args["prompt"]
-    model = v5tune(args["model_location"])
+    model = v5tune(args["model_location"]).cuda()
     state = torch.load(args["save_filename"])
     
     print("Base model:\n")
@@ -661,7 +666,7 @@ if args.get("prompt", False):
     prompt = world.encode(promptin)
     promptlength = len(prompt)
     for i in range(50):
-        prompt += [model.forward(prompt, state[1],state[0])[0,-1].argmax().cpu().item()]
+        prompt += [model.forward(prompt, (state[1][0].to(model.device),state[1][1].to(model.device)),state[0].to(model.device))[0,-1].argmax().cpu().item()]
         try:
             toshow = world.decode(prompt[promptlength:])
             if toshow == "\n\n":
