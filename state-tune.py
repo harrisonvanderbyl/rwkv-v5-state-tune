@@ -126,7 +126,7 @@ class RWKV_TimeMix(torch.jit.ScriptModule):
         
         g = self.silu(self.gate(xg))
         
-        if g.device == torch.device("cuda"):
+        if g.device.type == "cuda":
             
             # torch.zeros(B, T, H, V, dtype=torch.bfloat16, device=x.device)
             r:torch.Tensor = self.receptance(xr)
@@ -154,7 +154,7 @@ class RWKV_TimeMix(torch.jit.ScriptModule):
             v:torch.Tensor = self.value(xv).transpose(0,1).reshape(T,B*H,K).transpose(0,1) .float()
             
             # calculate time decay
-            wfor = self.time_decay.exp().neg().exp().pow(torch.arange(0,T,device=r.device).reshape(1,-1,1)).repeat(B,1,1)
+            wfor = self.time_decay.exp().neg().exp().unsqueeze(1).pow(torch.arange(0,T,device=r.device).reshape(1,-1,1)).repeat(B,1,1)
             
             
             #calculate the effects state has on the current activation
@@ -409,14 +409,14 @@ class v5tune( torch.nn.Module):
         
         return (
             (torch.ones(self.layers*2,B, 1, self.hidden, dtype=self.dtype, device=self.device)).requires_grad_(True),
-            (torch.ones(self.layers,B,self.heads, self.head_size, self.head_size, dtype=torch.bfloat16, device=self.device)).requires_grad_(True)
+            (torch.ones(self.layers,B,self.heads, self.head_size, self.head_size, dtype=torch.bfloat16 if self.device.type=="cuda" else torch.float32, device=self.device)).requires_grad_(True)
         )
         
     def zero_state(self, B, rand=False):
         
         return (
             (torch.zeros(self.layers*2,B, 1, self.hidden, dtype=self.dtype, device=self.device)).requires_grad_(True),
-            (torch.zeros(self.layers,B,self.heads, self.head_size, self.head_size, dtype=torch.bfloat16, device=self.device)).requires_grad_(True)
+            (torch.zeros(self.layers,B,self.heads, self.head_size, self.head_size, dtype=torch.bfloat16 if self.device.type=="cuda" else torch.float32, device=self.device)).requires_grad_(True)
         )
         
     def new_softembedding(self, B):
