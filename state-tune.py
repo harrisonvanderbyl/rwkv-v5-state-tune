@@ -45,7 +45,7 @@ class TimeShift(nn.Module):
         
         if not self.training:
             
-            next = torch.cat((self.state, x[:,:-1]), dim=1)
+            next = torch.cat((self.state.to(x.device), x[:,:-1]), dim=1)
             self.state = x[:,-1:].detach().clone()
             
         else:
@@ -151,7 +151,7 @@ class RWKV_TimeMix(nn.Module):
         if self.training:
             last_state_wkv = self.wkvstate.repeat(B,1,1)
         else:
-            last_state_wkv = self.wkvstate
+            last_state_wkv = self.wkvstate.to(x.device)
         K = last_state_wkv.shape[-2]
         
         # Perform the tokenshift
@@ -294,164 +294,76 @@ class Block(nn.Module):
         
         return x
 
+def identifyModelParams(file):
     
-class RWKV(nn.Module):
+    vocab_size, n_embd = file["emb.weight"].shape
+    
+    dim_ffn = file[f"blocks.0.ffn.value.weight"].shape[1]
+  
+    n_head = file[f"blocks.0.att.time_decay"].shape[0]
+    
+    headsize = n_embd // n_head
+    
+    n_layer = len([x for x in file.keys() if x.startswith("blocks.") and x.endswith(".att.time_decay")])
+    
+    return n_layer, n_embd, n_head, headsize, dim_ffn, vocab_size
+    
+    
+    
+    
 
-    def __init__(self,
-                 load_model: str,
-                 ):
 
- 
-        # Setup the parent class
-        super().__init__()
-           
-        try:
-            self.batches = micro_bsz
-        except:
-            self.batches = 1
-            micro_bsz = 1
 
-        try:
-            grad_cp
-        except:
-            grad_cp = 0
 
-        try:
-            ctx_len
-        except:
-            ctx_len = 1024
-
-        try:
-            modelpath = load_model
-
-        except:
-            modelpath = None
+class v5tune( torch.nn.Module):
+    def __init__(self, model_path):        
+        super(v5tune, self).__init__()
         
-        if modelpath:
-            file = torch.load(modelpath)
-            keys = list(file.keys())
-            # remove _orig_mod from keys for compatibility with torch.compile
-            newObj = {}
-            for key in keys:
-                if "_orig_mod." in key:
-                    newKey = key.replace("_orig_mod.", "")
-                    newObj[newKey] = file[key]
-                else:
-                    newObj[key] = file[key]
-            file = newObj
-            keys = list(file.keys())
-
-            # detect model details
-            vocab_size, n_embd = file["emb.weight"].shape
-            n_embd = n_embd
-            vocab_size = vocab_size
-            n_layer = 0
-            for key in keys:
-                if key.startswith("blocks."):
-                    layer = int(key.split(".")[1])
-                    if layer > n_layer:
-                        n_layer = layer
-            n_layer = n_layer + 1
-            # try:
-            dim_ffn = file[f"blocks.0.ffn.value.weight"].shape[1]
-            # except:
-            #     dim_ffn = 2 * n_embd
-            # model layers are model.2.x.yyy: find highest x
-            
-            try:
-                n_head = file[f"blocks.0.att.time_decay"].shape[0]
-            except:
-                n_head = 64
-           
-        else:
-            file = None
-
-        try:
-            dim_ffn = dim_ffn
-        except:
-            dim_ffn = int(3.5 * n_embd)
-            
+        file = torch.load(model_path)
         
-        self.n_embd = n_embd
+        self.n_layer, self.n_embd, self.n_head, self.head_size, self.dim_ffn, self.vocab_size = identifyModelParams(file)
         
-        self.n_layer = n_layer
-        
-        self.n_head = n_head
-        
-        self.head_size = n_embd // n_head
-        
-        self.dim_ffn = dim_ffn
-        
-        self.emb = nn.Embedding(vocab_size, n_embd)
+        self.device = torch.device("cuda")
+        self.dtype = torch.bfloat16
+      
+        self.emb = nn.Embedding(self.vocab_size, self.n_embd)
         
         self.blocks = nn.Sequential(*[
         
-            Block(i, n_layer, n_embd, n_head, self.head_size, n_embd, dim_ffn) for i in range(n_layer)
+            Block(i, self.n_layer, self.n_embd, self.n_head, self.head_size, self.n_embd, self.dim_ffn) for i in range(self.n_layer)
         ])
         
-        self.head = nn.Linear(n_embd, vocab_size, bias=False)
+        self.head = nn.Linear(self.n_embd, self.vocab_size, bias=False)
         
         file["ln_in.weight"] = file.pop("blocks.0.ln0.weight")
         file["ln_in.bias"] = file.pop("blocks.0.ln0.bias")
         
-        self.ln_in = nn.LayerNorm(n_embd)
-        self.ln_out = nn.LayerNorm(n_embd)
+        self.ln_in = nn.LayerNorm(self.n_embd)
+        self.ln_out = nn.LayerNorm(self.n_embd)
         
         self.load_state_dict(file)
         
         
-            
+        self.to(self.dtype)
+        self.to(self.device)
+        
+      
+        
+        self.requires_grad_(False)
+        
+        
+    def to_device(self, tensor):
+        return torch.tensor(tensor, device=self.emb.weight.device)
 
-    def forward(self, idx: torch.Tensor):
-        x = self.emb(idx)
+    def forward(self, idx):
+        x = self.to_device(idx)
+        x = self.emb(x)
         x = self.ln_in(x)
         x = self.blocks(x)
         x = self.ln_out(x)
         x = self.head(x)
         return x
-
-
-
-class v5tune( torch.nn.Module):
-    def __init__(self, model_path):
-        self.model_name = 'v5-simple'
         
-        super(v5tune, self).__init__()
-        self.device = torch.device("cuda")
-        self.dtype = torch.bfloat16
-      
-        self.model = RWKV(load_model=model_path)
-        self.model = self.model.to(self.dtype)
-        self.model = self.model.to(self.device)
-        
-        self.layers = self.model.n_layer
-        self.hidden = self.model.n_embd
-        self.head_size = self.model.head_size
-        self.heads = self.model.n_head
-        
-        self.model.requires_grad_(False)
-        
-        
-        
-
-    def forward(self, idx ,  **kwargs):
-
-        if isinstance(idx, list):
-            idx = torch.tensor(idx, device=self.device, dtype=torch.int64)
-        # if idx is int, make tensor
-        if isinstance(idx, int):
-            idx = torch.tensor([idx], device=self.device, dtype=torch.int64)
-        
-        # if idx is not 3 dim tensor, make it 3 dim
-        if len(idx.shape) == 1:
-            idx = idx.unsqueeze(0)
-            idx = idx.repeat(1, 1)
-            
-    
-            
-        output = self.model.forward(idx)
-        
-        return output
     
         
         
@@ -460,33 +372,24 @@ class v5tune( torch.nn.Module):
         func = torch.randn if rand else torch.zeros
         return {
                 **{
-                    f"blocks.{i}.att.shift.state":func(B, 1, self.hidden, dtype=self.dtype, device=self.device).mul(scale).add(offset).requires_grad_(True) for i in range(self.layers)
+                    f"blocks.{i}.att.shift.state":func(B, 1, self.n_embd, dtype=self.emb.weight.dtype, device=self.emb.weight.device).mul(scale).add(offset).requires_grad_(True) for i in range(self.n_layer)
                 },
                 **{
-                    f"blocks.{i}.ffn.shift.state": func(B, 1, self.hidden, dtype=self.dtype, device=self.device).mul(scale).add(offset).requires_grad_(True) for i in range(self.layers)
+                    f"blocks.{i}.ffn.shift.state": func(B, 1, self.n_embd, dtype=self.emb.weight.dtype, device=self.emb.weight.device).mul(scale).add(offset).requires_grad_(True) for i in range(self.n_layer)
                 },
                 **{
-                    f"blocks.{i}.att.wkvstate": func(B* self.heads, self.head_size, self.head_size, dtype=self.dtype, device=self.device).mul(scale).add(offset).requires_grad_(True) for i in range(self.layers)
+                    f"blocks.{i}.att.wkvstate": func(B* self.n_head, self.head_size, self.head_size, dtype=self.emb.weight.dtype, device=self.emb.weight.device).mul(scale).add(offset).requires_grad_(True) for i in range(self.n_layer)
                 }
         }
         
     def load_state(self, state):
-        self.model.load_state_dict(state, strict=False)
+        self.load_state_dict(state, strict=False)
         return self
         
-
-    def new_softembedding(self, B):
-        return torch.zeros(B, 1,self.hidden, dtype=self.dtype, device=self.device).requires_grad_(True)
     
-    def cpu(self):
-        self.device = torch.device("cpu")
-        self.model = self.model.to(self.device)
-        return self
+   
     
-    def to(self, device):
-        self.device = device
-        self.model = self.model.to(device)
-        return self
+   
 
     
         
@@ -706,7 +609,7 @@ if args.get("prompt", False):
     prompt = world.encode(promptin)
     promptlength = len(prompt)
     for i in range(50):
-        prompt = [model.forward(prompt)[0,-1].argmax().cpu().item()]
+        prompt = [model.forward([prompt])[0,-1].argmax().cpu().item()]
         try:
             toshow = world.decode(prompt)
             if toshow == "\n\n":
@@ -722,7 +625,7 @@ if args.get("prompt", False):
     prompt = world.encode(promptin)
     promptlength = len(prompt)
     for i in range(50):
-        prompt = [model.forward(prompt)[0,-1].argmax().cpu().item()]
+        prompt = [model.forward([prompt])[0,-1].argmax().cpu().item()]
         try:
             toshow = world.decode(prompt)
             if toshow == "\n\n":
