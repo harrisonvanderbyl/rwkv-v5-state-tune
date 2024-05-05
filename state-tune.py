@@ -9,6 +9,7 @@ from tokenizer import world
 import torch.nn as nn
 
 from b2sdk.v2 import B2Api, InMemoryAccountInfo
+from cuda.v5chunk import RUN_CUDA_RWKV5
 
 
 def download_file(filee, output):
@@ -89,7 +90,7 @@ class RWKV_TimeMix(torch.jit.ScriptModule):
         self.ln_x = nn.GroupNorm(n_head, dim_att, eps=64e-5)
 
         
-        self.register_buffer("time_decay", torch.zeros(n_head, 1, self.head_size))
+        self.register_buffer("time_decay", torch.zeros(n_head, self.head_size))
         self.register_buffer("time_faaaa", torch.zeros(n_head, self.head_size))
         
         self.silu = nn.SiLU()
@@ -97,7 +98,7 @@ class RWKV_TimeMix(torch.jit.ScriptModule):
         
     def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
         
-        state_dict[prefix+"time_decay"] = state_dict[prefix+"time_decay"].double().exp().neg().exp().view(self.n_head,1,-1).float().contiguous()
+        state_dict[prefix+"time_decay"] = state_dict[prefix+"time_decay"].double().view(self.n_head,-1).float().contiguous()
         state_dict[prefix+"time_faaaa"] = state_dict[prefix+"time_faaaa"].view(self.n_head,self.head_size)
         a = super()._load_from_state_dict(state_dict, prefix, local_metadata, False, missing_keys, unexpected_keys, error_msgs)
         
@@ -125,46 +126,68 @@ class RWKV_TimeMix(torch.jit.ScriptModule):
         
         g = self.silu(self.gate(xg))
         
-        
-        # torch.zeros(B, T, H, V, dtype=torch.bfloat16, device=x.device)
-        r:torch.Tensor = self.receptance(xr).transpose(0,1).reshape(T,B*H,K).transpose(0,1).float()
-        k:torch.Tensor = self.key(xk).transpose(0,1).reshape(T,B*H,K).transpose(0,1)   .float() 
-        v:torch.Tensor = self.value(xv).transpose(0,1).reshape(T,B*H,K).transpose(0,1) .float()
-        
-        # calculate time decay
-        wfor = self.time_decay.pow(torch.arange(0,T,device=r.device).reshape(1,-1,1)).repeat(B,1,1)
-        
-        
-        #calculate the effects state has on the current activation
-        rwfor = r.mul(wfor)
-        
-        u:torch.Tensor = self.time_faaaa.view(H,1,K).repeat(B,1,1)
-        
-        xr = torch.bmm(rwfor,last_state_wkv.view(-1,K,K).transpose(1,2))
-        
-        xr += (k*(u*r)).sum(-1,True).mul(v).reshape(-1,T,K)
-        
-        xrr = xr
-        
-        # calculate the effects kvr have on the future activations
-        r = r[:,1:]
-        k = k[:,:-1].transpose(1,2)
-        v = v[:,:-1]
-        xrr = xr[:,1:]
-        
-        wback = wfor[:,torch.arange(T-2,-1,-1)].transpose(1,2)        
-        
-        k = k.mul(wback)
-                
-        # 64,T,T
-        splits = 64
-        for i in range(0,T, splits):
-            for j in range(0,T, splits):
-                mkk = torch.bmm(r[:,i:i+splits],k[:,:,j:j+splits]).tril(i-j)
+        if g.device == torch.device("cuda"):
             
-                mrr = xrr[:,i:i+splits]
-                mrr[:] = torch.baddbmm(mrr,mkk,v[:,j:j+splits])
+            # torch.zeros(B, T, H, V, dtype=torch.bfloat16, device=x.device)
+            r:torch.Tensor = self.receptance(xr)
+            k:torch.Tensor = self.key(xk)    
+            v:torch.Tensor = self.value(xv) 
+            
+            # calculate time decay
+            wfor = self.time_decay.exp().neg().exp().view(1,1,-1).pow(torch.arange(0,T,device=r.device).reshape(1,-1,1)).repeat(B,1,1)
+            # wfor[:,0] = 0
+            
+            #calculate the effects state has on the current activation
+            rwfor = r.mul(wfor).reshape(B,T,H,K).transpose(1,2).reshape(B*H,T,K)
+            
+            
+            xr = torch.bmm(rwfor,last_state_wkv.view(-1,K,K).transpose(1,2)).view(B,H,T,K).transpose(1,2).reshape(B,T,H*K)
+            
+            xr += RUN_CUDA_RWKV5(B,T,C,H,r,k,v,self.time_decay,self.time_faaaa)
+        
+            
+        else:    
+                       
+            # torch.zeros(B, T, H, V, dtype=torch.bfloat16, device=x.device)
+            r:torch.Tensor = self.receptance(xr).transpose(0,1).reshape(T,B*H,K).transpose(0,1).float()
+            k:torch.Tensor = self.key(xk).transpose(0,1).reshape(T,B*H,K).transpose(0,1)   .float() 
+            v:torch.Tensor = self.value(xv).transpose(0,1).reshape(T,B*H,K).transpose(0,1) .float()
+            
+            # calculate time decay
+            wfor = self.time_decay.exp().neg().exp().pow(torch.arange(0,T,device=r.device).reshape(1,-1,1)).repeat(B,1,1)
+            
+            
+            #calculate the effects state has on the current activation
+            rwfor = r.mul(wfor)
+            
+            u:torch.Tensor = self.time_faaaa.view(H,1,K).repeat(B,1,1)
+            
+            xr = torch.bmm(rwfor,last_state_wkv.view(-1,K,K).transpose(1,2))
+            
+            xr += (k*(u*r)).sum(-1,True).mul(v).reshape(-1,T,K)
+            
+            xrr = xr
+            
+            # calculate the effects kvr have on the future activations
+            r = r[:,1:]
+            k = k[:,:-1].transpose(1,2)
+            v = v[:,:-1]
+            xrr = xr[:,1:]
+            
+            wback = wfor[:,torch.arange(T-2,-1,-1)].transpose(1,2)        
+            
+            k = k.mul(wback)
+                    
+            # 64,T,T
+            splits = 64
+            for i in range(0,T, splits):
+                for j in range(0,T, splits):
+                    mkk = torch.bmm(r[:,i:i+splits],k[:,:,j:j+splits]).tril(i-j)
                 
+                    mrr = xrr[:,i:i+splits]
+                    mrr[:] = torch.baddbmm(mrr,mkk,v[:,j:j+splits])
+                    
+        
     
                 
         # Reshape and normalize the logits
@@ -173,7 +196,6 @@ class RWKV_TimeMix(torch.jit.ScriptModule):
 
         # Return the logits and the state
         return x_logits
-    
 
 
 
@@ -387,14 +409,14 @@ class v5tune( torch.nn.Module):
         
         return (
             (torch.ones(self.layers*2,B, 1, self.hidden, dtype=self.dtype, device=self.device)).requires_grad_(True),
-            (torch.ones(self.layers,B,self.heads, self.head_size, self.head_size, dtype=torch.float, device=self.device)).requires_grad_(True)
+            (torch.ones(self.layers,B,self.heads, self.head_size, self.head_size, dtype=torch.bfloat16, device=self.device)).requires_grad_(True)
         )
         
     def zero_state(self, B, rand=False):
         
         return (
             (torch.zeros(self.layers*2,B, 1, self.hidden, dtype=self.dtype, device=self.device)).requires_grad_(True),
-            (torch.zeros(self.layers,B,self.heads, self.head_size, self.head_size, dtype=torch.float, device=self.device)).requires_grad_(True)
+            (torch.zeros(self.layers,B,self.heads, self.head_size, self.head_size, dtype=torch.bfloat16, device=self.device)).requires_grad_(True)
         )
         
     def new_softembedding(self, B):
