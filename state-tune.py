@@ -279,19 +279,10 @@ class Block(nn.Module):
 
     def forward(self, x):
 
-        att_out = self.att(
-                self.ln1(x)
-            )
-
+        x = x + self.att(self.ln1(x))
         
-        x = x + att_out
-        
-        ffn_out = self.ffn(
-            self.ln2(x)
-        )
-        
-        x = x + ffn_out
-        
+        x = x + self.ffn(self.ln2(x))
+                
         return x
 
 def identifyModelParams(file):
@@ -308,28 +299,20 @@ def identifyModelParams(file):
     
     return n_layer, n_embd, n_head, headsize, dim_ffn, vocab_size
     
-    
-    
-    
-
 
 
 
 class v5tune( torch.nn.Module):
-    def __init__(self, model_path):        
+    def __init__(self, model_path, device="cuda"):        
         super(v5tune, self).__init__()
         
-        file = torch.load(model_path)
+        file = torch.load(model_path, map_location=device)
         
         self.n_layer, self.n_embd, self.n_head, self.head_size, self.dim_ffn, self.vocab_size = identifyModelParams(file)
         
-        self.device = torch.device("cuda")
-        self.dtype = torch.bfloat16
-      
         self.emb = nn.Embedding(self.vocab_size, self.n_embd)
         
         self.blocks = nn.Sequential(*[
-        
             Block(i, self.n_layer, self.n_embd, self.n_head, self.head_size, self.n_embd, self.dim_ffn) for i in range(self.n_layer)
         ])
         
@@ -342,12 +325,6 @@ class v5tune( torch.nn.Module):
         self.ln_out = nn.LayerNorm(self.n_embd)
         
         self.load_state_dict(file)
-        
-        
-        self.to(self.dtype)
-        self.to(self.device)
-        
-      
         
         self.requires_grad_(False)
         
@@ -497,7 +474,7 @@ def train_model(
     batch = torch.tensor(rightpadded)
 
     # load model
-    model = v5tune(model_location).cuda()
+    model = v5tune(model_location).bfloat16().cuda()
     
     # initialize state
     loss = 4.0
@@ -601,7 +578,7 @@ def train_model(
     
 if args.get("prompt", False):
     promptin = args["prompt"]
-    model = v5tune(args["model_location"]).to(args.get("device", "cuda")).train(False)
+    model = v5tune(args["model_location"]).to(args.get("device", "cuda"), torch.bfloat16).train(False)
     model.load_state(model.new_state())
     state = torch.load(args["save_filename"])
     
