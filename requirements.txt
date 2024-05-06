@@ -2,3 +2,4 @@ b2sdk
 torch
 datasets
 matplotlib
+ninja
