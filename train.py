@@ -573,48 +573,49 @@ def train_model(
         plt.legend()
         plt.show()
         
-        
+    return model
 
-    
-if args.get("prompt", False):
-    promptin = args["prompt"]
-    model = v5tune(args["model_location"]).to(args.get("device", "cuda"), torch.bfloat16).train(False)
-    model.load_state(model.new_state())
-    state = torch.load(args["save_filename"])
-    
-    print("Base model:\n")
-    prompt = world.encode(promptin)
-    promptlength = len(prompt)
-    for i in range(50):
-        prompt = [model.forward([prompt])[0,-1].argmax().cpu().item()]
-        try:
-            toshow = world.decode(prompt)
-            if toshow == "\n\n":
-                break
-            promptlength += 1
-            print(toshow, end="", flush=True)
-        except:
-            continue
+# if called from command line
+if __name__ == "__main__":
+    if args.get("prompt", False):
+        promptin = args["prompt"]
+        model = v5tune(args["model_location"]).to(args.get("device", "cuda"), torch.bfloat16).train(False)
+        model.load_state(model.new_state())
+        state = torch.load(args["save_filename"])
         
-    model.load_state(state)
-    
-    print("\n\nTuned model:\n")
-    prompt = world.encode(promptin)
-    promptlength = len(prompt)
-    for i in range(50):
-        prompt = [model.forward([prompt])[0,-1].argmax().cpu().item()]
-        try:
-            toshow = world.decode(prompt)
-            if toshow == "\n\n":
-                break
-            promptlength += 1
-            print(toshow, end="", flush=True)
-        except:
-            continue
+        print("Base model:\n")
+        prompt = world.encode(promptin)
+        promptlength = len(prompt)
+        for i in range(50):
+            prompt = [model.forward([prompt])[0,-1].argmax().cpu().item()]
+            try:
+                toshow = world.decode(prompt)
+                if toshow == "\n\n":
+                    break
+                promptlength += 1
+                print(toshow, end="", flush=True)
+            except:
+                continue
+            
+        model.load_state(state)
         
-    
-    print("\n\n")
-else:
-    train_model(**args)
+        print("\n\nTuned model:\n")
+        prompt = world.encode(promptin)
+        promptlength = len(prompt)
+        for i in range(50):
+            prompt = [model.forward([prompt])[0,-1].argmax().cpu().item()]
+            try:
+                toshow = world.decode(prompt)
+                if toshow == "\n\n":
+                    break
+                promptlength += 1
+                print(toshow, end="", flush=True)
+            except:
+                continue
+            
+        
+        print("\n\n")
+    else:
+        train_model(**args)
 
 

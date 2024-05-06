@@ -10,6 +10,8 @@
 
 `tokenizer.py` Tokenizer module for eagle
 
+`notebook.ipynb` A jupyter notebook to explore state tuning
+
 ### Whats not in the box
 
 `model.pth` The model is not included, Here is some v5 models for download: [Eagle 0.6->7B](https://huggingface.co/BlinkDL/rwkv-5-world/tree/main) and [EagleX v2](https://huggingface.co/RWKV/v5-EagleX-v2-7B-pth/tree/main)
@@ -26,7 +28,7 @@ these also work as ENV variables in the format --key=value
 
 **Training**
 ```sh
-python3 ./state-tune.py \
+python3 ./train.py \
 --learningrate 0.01 \
 --batchsize 4 \
 --exit_loss 1.5 \
@@ -50,7 +52,7 @@ python3 ./state-tune.py \
 This uses a temperature of 0
 
 ```sh
-python3 ./state-tune.py \
+python3 ./train.py \
 --model_location model.pth \
 --save_filename state.pth \
 --prompt "user: How is you day going?\n\nassistant:" \
